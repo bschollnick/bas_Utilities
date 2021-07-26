@@ -49,6 +49,10 @@ import pathlib
 import os
 import sys
 
+from dateutil.parser import parse
+from dateutil.parser._parser import ParserError
+
+
 def ensure_dirs(dpath):
     """
     If the directory path does not exist,
@@ -77,6 +81,12 @@ def mdy_to_ymd_str(mdy, in_sep="-", out_sep="-"):
         out_sep (string): The default separator character between the values
             by default that is "-" for the outbound string
 
+        reject_blank (Boolean): If True, if the date can not be parsed, return None
+                                If False, the existing mdy value will be returned
+
+                           Thus if False, invalid data can be returned (it's the
+                           original data that was sent into the function)
+
     Returns:
         datetime: string
             in yyyy-mm-dd format (assuming it's not overriden by out_sep)
@@ -98,9 +108,77 @@ def mdy_to_ymd_str(mdy, in_sep="-", out_sep="-"):
     """
     output = ""
     if mdy not in [None, ""]:
-        output = datetime.datetime.strptime(mdy, "%m{}%d{}%Y".format(in_sep, in_sep))
-        output = output.strftime("%Y{}%m{}%d".format(out_sep, out_sep))
+        try:
+            output = datetime.datetime.strptime(mdy, "%m{}%d{}%Y".format(in_sep, in_sep))
+            output = output.strftime("%Y{}%m{}%d".format(out_sep, out_sep))
+        except ValueError:
+            return None
     return output
+
+def mdy_to_ymd_flex_str(mdy, in_sep=r"-", out_sep="-", yearFirst=False, dayFirst=False, reject_blank=False, default_yr=2000):
+    """
+    Convert from mm/dd/yyyy datetime date string to a yyyy-mm-dd string.
+
+    see https://github.com/dateutil/dateutil/issues/703# regarding dateutils defaulting of century.
+
+    Args:
+        mdy (string): The DateTime date string (%m-%d-%Y) to be converted
+        def_sep (string): A string of separator characters that should be removed.
+
+        out_sep (string): The default separator character between the values
+            by default that is "-" for the outbound string
+
+        reject_blank (Boolean): If True, if the date can not be parsed, return None
+                                If False, the existing mdy value will be returned
+
+                           Thus if False, invalid data can be returned (it's the
+                           original data that was sent into the function)
+
+    Returns:
+        datetime: string
+            in yyyy-mm-dd format (assuming it's not overriden by out_sep)
+
+    .. code-block:
+
+    >>> import datetime
+    >>> test = datetime.datetime(2018,1,1).strftime("%m-%d-%Y")
+    >>> mdy_to_ymd_flex_str(test)
+    '2018-01-01'
+    >>> mdy_to_ymd_flex_str("08-26-2019")
+    '2019-08-26'
+    >>> common.mdy_to_ymd_flex_str("08-24-2019")
+    '2019-08-24'
+    >>> common.mdy_to_ymd_flex_str("08-24-2019", out_sep="/")
+    '2019/08/24'
+    >>> common.mdy_to_ymd_flex_str("08*24*2019", in_sep="*", out_sep="/")
+    '2019/08/24'
+    """
+
+    from dateutil.parser import parserinfo, parser
+    class parserinfo_20c(parserinfo):
+        def convertyear(self, year, century_specified=False):
+            if not century_specified and year < 100:
+                year += default_yr
+            return year
+
+    parser_20c = parser(parserinfo_20c())
+
+    def parse_20c(timestr, **kwargs):
+        return parser_20c.parse(timestr, **kwargs)
+            # mm-dd-yyyy    # 10    -> mmddyyyy     # 8
+            # mm-dd-yy      # 8     -> mmddyy       # 6
+            # mmddyy        # 6     -> mmddyy       # 6
+
+    mdy = mdy.replace(in_sep, "-")
+    if mdy not in [None, ""]:
+        try:
+            mdy = parse_20c(mdy, yearfirst=yearFirst, dayfirst=dayFirst).strftime("%Y{}%m{}%d".format(out_sep, out_sep)) # if out_seps requested, they are added.
+        except ParserError:
+            mdy = False
+            print("Parser Error")
+            if reject_blank:
+                return None
+    return mdy
 
 def float_to_ymd_str(float_value, out_sep="-"):
     """
@@ -167,6 +245,18 @@ class BaseCsvFile():
         self.readCount = None
         self.source = None
 
+    def quote_all(self):
+        self.quoting = csv.QUOTE_ALL
+
+    def quote_minimal(self):
+        self.quoting = csv.QUOTE_MINIMAL
+
+    def quote_nonnumeric(self):
+        self.quoting = csv.QUOTE_NONNUMERIC
+
+    def quote_none(self):
+        self.quoting = csv.QUOTE_NONE
+
     def close(self):
         """
         Close the file handle
@@ -175,7 +265,7 @@ class BaseCsvFile():
             self.__fh.close()
 
     def setup_read(self, delimiter=',', force_headers=False,
-                   remap_source=False):
+                   remap_source=False, encoding='utf-8-sig'):
         """
         Configure for Read only.
 
@@ -207,7 +297,8 @@ class BaseCsvFile():
             to call setup_read() or setup_write() to configure for those
             purposes.
 
-
+        https://stackoverflow.com/questions/34399172/
+            why-does-my-python-code-print-the-extra-characters-%C3%AF-when-reading-from-a-tex/
         """
         if self.reading:
             raise RuntimeError("Duplicate Request - Already setup for Reading.")
@@ -218,11 +309,16 @@ class BaseCsvFile():
             raise RuntimeError("File Does not Exist")
             #return False
 
-        self.__fh = self.path.open(mode='r', newline='')
+        if encoding == None:
+            self.__fh = self.path.open(mode='r', newline='')
+        else:
+            self.__fh = self.path.open(mode='r', newline='', encoding=encoding)
+
         if remap_source:
             self.source = remap_source(self.__fh)
         else:
             self.source = self.__fh
+
         if force_headers:
             self.csv_handler = csv.DictReader(self.source,
                                               delimiter=delimiter,
@@ -288,6 +384,19 @@ class BaseCsvFile():
 
         self.writing = True
         return True
+
+    def clear_record(self):
+        """
+        Return a dictionary that contains the headers (as key),
+        and empty values.
+
+        This way, you can populate the fields that need to be populated
+        without the worry of missing a field.
+        """
+        output = {}
+        for field in self.output_headers:
+            output[field] = ""
+        return output
 
     def flush(self):
         self.__fh.flush()
@@ -450,7 +559,7 @@ class BaseCsvFile():
         return None
 
 
-    def _read_by_key(self, key=None, clean_func=None, revealConflicts=False):
+    def _read_by_key(self, key=None, restrictFields=None, clean_func=None, revealConflicts=False):
         """
         Args:
             key (string): Key is the column (of the header) to use as the key
@@ -459,6 +568,16 @@ class BaseCsvFile():
 
             clean_func (func): If None, do not perform cleaning.  To Enable
                 pass the function into the argument.
+
+            restrictFields (list): This list contains the names (case-insensitive)
+                of the columns to be gathered and stored in the data returned.
+                (eg. If the database has Column1, Column2, Column3, Columnxx,
+                    and you only want Column 3, restrictFields=["Column3"],
+                    if you want column 1, 3, xx,
+                        restrictFields=["Column1", "Column3", Columnxx"]
+
+                        Mainly supplied to reduce memory consumption for larger
+                        csv's.
 
         Returns:
             Dictionary: Dictionary of data from the extract.
@@ -546,6 +665,11 @@ class BaseCsvFile():
                 if revealConflicts:
                     print("Conflict: ", keyvalue)
             else:
+                if restrictFields != None:
+                    kvalues = list(row.keys())
+                    for x in kvalues:
+                        if x.title() not in restrictFields and x in row:
+                            del(row[x])
                 data[keyvalue] = row
                 self.readCount += 1
         return data
